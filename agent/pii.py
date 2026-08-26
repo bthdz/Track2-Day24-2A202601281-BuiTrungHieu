@@ -31,9 +31,63 @@ set ở tests/vn_pii_testset.jsonl):
 from __future__ import annotations
 
 
+import re
+
+
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+_STK_PREFIX_RE = re.compile(r"(?:STK|stk|số tài khoản|So tai khoan)\s*(\d{8,16})\b", re.IGNORECASE)
+_CCCD_PREFIX_RE = re.compile(r"(?:CCCD|cccd|căn cước|can cuoc)(?:\s+của[^\d:]*)?[:\s]+(\d{12})\b", re.IGNORECASE)
+_GENERIC_CCCD_RE = re.compile(r"\b\d{12}\b")
+_GENERIC_PHONE_RE = re.compile(r"\b0\d{9}\b")
+
+
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    entities = []
+
+    # 1. EMAIL
+    for m in _EMAIL_RE.finditer(text):
+        entities.append({"type": "EMAIL", "start": m.start(), "end": m.end()})
+
+    # 2. VN_BANK_ACCOUNT (explicit STK context or 8-16 digits after STK)
+    stk_spans = set()
+    for m in _STK_PREFIX_RE.finditer(text):
+        digits_start, digits_end = m.start(1), m.end(1)
+        stk_spans.add((digits_start, digits_end))
+        entities.append({"type": "VN_BANK_ACCOUNT", "start": digits_start, "end": digits_end})
+
+    # 3. VN_CCCD
+    cccd_spans = set()
+    for m in _CCCD_PREFIX_RE.finditer(text):
+        d_start, d_end = m.start(1), m.end(1)
+        if (d_start, d_end) not in stk_spans:
+            cccd_spans.add((d_start, d_end))
+            entities.append({"type": "VN_CCCD", "start": d_start, "end": d_end})
+
+    for m in _GENERIC_CCCD_RE.finditer(text):
+        d_start, d_end = m.start(), m.end()
+        if (d_start, d_end) not in stk_spans and (d_start, d_end) not in cccd_spans:
+            cccd_spans.add((d_start, d_end))
+            entities.append({"type": "VN_CCCD", "start": d_start, "end": d_end})
+
+    # 4. VN_PHONE
+    phone_spans = set()
+    for m in _GENERIC_PHONE_RE.finditer(text):
+        p_start, p_end = m.start(), m.end()
+        if (p_start, p_end) not in stk_spans and (p_start, p_end) not in cccd_spans:
+            phone_spans.add((p_start, p_end))
+            entities.append({"type": "VN_PHONE", "start": p_start, "end": p_end})
+
+    entities.sort(key=lambda x: x["start"])
+    return entities
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    entities = detect(text)
+    sorted_entities = sorted(entities, key=lambda x: x["start"], reverse=True)
+    res = text
+    for e in sorted_entities:
+        start, end = e["start"], e["end"]
+        label = f"[REDACTED_{e['type']}]"
+        res = res[:start] + label + res[end:]
+    return res
+

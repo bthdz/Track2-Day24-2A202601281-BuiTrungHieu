@@ -36,9 +36,63 @@ from __future__ import annotations
 from pathlib import Path
 
 
+import hashlib
+import json
+from pathlib import Path
+
+
+def _compute_hash(entry_dict: dict) -> str:
+    d = {k: v for k, v in entry_dict.items() if k != "hash"}
+    raw = json.dumps(d, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prev_hash = "0" * 64
+    if path.exists() and path.stat().st_size > 0:
+        lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        if lines:
+            last_entry = json.loads(lines[-1])
+            prev_hash = last_entry.get("hash", "0" * 64)
+
+    full_entry = dict(entry)
+    full_entry["prev_hash"] = prev_hash
+    full_entry["hash"] = _compute_hash(full_entry)
+
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(full_entry, ensure_ascii=False) + "\n")
+
+    return full_entry
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    if not path.exists():
+        return False
+    lines = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not lines:
+        return False
+
+    expected_prev_hash = "0" * 64
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except Exception:
+            return False
+
+        reason = record.get("reason")
+        if not reason or not isinstance(reason, str) or not reason.strip():
+            return False
+
+        if record.get("prev_hash") != expected_prev_hash:
+            return False
+
+        stored_hash = record.get("hash")
+        computed_hash = _compute_hash(record)
+        if stored_hash != computed_hash:
+            return False
+
+        expected_prev_hash = stored_hash
+
+    return True
+

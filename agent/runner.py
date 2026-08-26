@@ -59,5 +59,123 @@ REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
 
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+from agent import ledger, policy, tools
+
+REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
+DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+
+
+def _make_args_hash(kwargs: dict) -> str:
+    raw = json.dumps(kwargs, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def handle(message: str, llm, log_dir: Path | None = None) -> str:
-    raise NotImplementedError("BƯỚC 3c: implement trifecta split")
+    ledger_path = (log_dir / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+
+    # --- RUN A: Search Docs (Untrusted Content) ---
+    ctx_run_a = policy.PolicyContext(
+        data_classification="public",
+        request_purpose="search-docs",
+        agent_owner="run-a",
+        delegation_depth=0,
+        egress_enabled=False,
+    )
+    allow_a, reason_a = policy.check(ctx_run_a)
+    ledger.append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "lab24-agent",
+            "run_id": run_id,
+            "tool": "search_docs",
+            "args_hash": _make_args_hash({"query": message}),
+            "classification": "public",
+            "decision": "allow" if allow_a else "deny",
+            "reason": reason_a,
+        },
+        ledger_path,
+    )
+
+    if not allow_a:
+        return "Yêu cầu bị từ chối bởi policy."
+
+    docs = tools.search_docs(message)
+    combined_text = "\n\n".join(d["text"] for d in docs)
+
+    extracted_ticket_ids = set()
+    for d in docs:
+        found_ids = re.findall(r"ticket-(\d+)", d["id"])
+        for tid in found_ids:
+            extracted_ticket_ids.add(int(tid))
+
+    # Check for prompt injection in untrusted text
+    injected = llm.find_injection(combined_text)
+    if injected is not None:
+        ctx_egress = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="exfiltrate-pii",
+            agent_owner="run-a",
+            delegation_depth=1,
+            egress_enabled=True,
+        )
+        allow_egress, reason_egress = policy.check(ctx_egress)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": "lab24-agent",
+                "run_id": run_id,
+                "tool": "http_post",
+                "args_hash": _make_args_hash({"url": injected.target_url}),
+                "classification": "restricted",
+                "decision": "allow" if allow_egress else "deny",
+                "reason": reason_egress,
+            },
+            ledger_path,
+        )
+
+    # --- RUN B: Read Customer (Trusted Data Lookup) ---
+    customers_data = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    valid_customer_ids = []
+    for cust in customers_data:
+        related = cust.get("related_tickets", [])
+        if any(tid in related for tid in extracted_ticket_ids):
+            valid_customer_ids.append(cust["customer_id"])
+
+    for cid in valid_customer_ids:
+        ctx_b = policy.PolicyContext(
+            data_classification="internal",
+            request_purpose="read-customer-details",
+            agent_owner="run-b",
+            delegation_depth=1,
+            egress_enabled=False,
+        )
+        allow_b, reason_b = policy.check(ctx_b)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": "lab24-agent",
+                "run_id": run_id,
+                "tool": "read_customer",
+                "args_hash": _make_args_hash({"customer_id": cid}),
+                "classification": "internal",
+                "decision": "allow" if allow_b else "deny",
+                "reason": reason_b,
+            },
+            ledger_path,
+        )
+        if allow_b:
+            try:
+                tools.read_customer(cid)
+            except tools.ToolError:
+                pass
+
+    return llm.summarize(docs)
+

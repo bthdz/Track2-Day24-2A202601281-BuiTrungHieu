@@ -46,6 +46,9 @@ def make_handler(log_path: Path):
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "2")
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(b"{}")
 
